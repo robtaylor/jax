@@ -1,4 +1,4 @@
-# JAX-Metal plugin CI
+#co JAX-Metal plugin CI
 
 name: Jax-Metal CI
 on:
@@ -22,8 +22,9 @@ jobs:
       fail-fast: false # don't cancel all jobs on failure
       matrix:
         jaxlib-version: ["pypi_latest", "nightly"]
+        runner: ["macos-latest", "macos-14"]
     name: "Jax-Metal plugin test (jaxlib=${{ matrix.jaxlib-version }})"
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - name: Get repo
