@@ -551,6 +551,17 @@ def _spsolve_cpu_lowering(ctx, data, indices, indptr, b, tol, reorder):
   return result
 
 
+def _spsolve_iree_metal_lowering(ctx, data, indices, indptr, b, *, tol, reorder):
+  """Lowering for IREE Metal backend using BaSpaCho sparse solver.
+
+  This emits a custom_call that IREE's StableHLO conversion will recognize
+  and route to the sparse_solver VM module, which uses the BaSpaCho library
+  for efficient sparse direct solves on Metal GPUs.
+  """
+  del tol, reorder  # BaSpaCho uses its own internal tolerance/reordering
+  return ffi.ffi_lowering("iree_spsolve")(ctx, data, indices, indptr, b)
+
+
 def _spsolve_jvp_lhs(data_dot, data, indices, indptr, b, **kwds):
     # d/dM M^-1 b = M^-1 M_dot M^-1 b
     p = spsolve(data, indices, indptr, b, **kwds)
@@ -595,6 +606,7 @@ ad.defjvp(spsolve_p, _spsolve_jvp_lhs, None, None, _spsolve_jvp_rhs)
 ad.primitive_transposes[spsolve_p] = _spsolve_transpose
 mlir.register_lowering(spsolve_p, _spsolve_gpu_lowering, platform='cuda')
 mlir.register_lowering(spsolve_p, _spsolve_cpu_lowering, platform='cpu')
+mlir.register_lowering(spsolve_p, _spsolve_iree_metal_lowering, platform='iree_metal')
 
 
 def spsolve(data, indices, indptr, b, tol=1e-6, reorder=1):
