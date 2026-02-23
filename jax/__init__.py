@@ -136,6 +136,7 @@ from jax._src.sharding_impls import NamedSharding as NamedSharding
 from jax._src.sharding_impls import make_mesh as make_mesh
 from jax._src.sharding_impls import set_mesh as set_mesh
 from jax._src.partition_spec import P as P
+from jax._src.pjit import reshard as reshard
 
 from jax._src.shard_map import shard_map as shard_map
 from jax._src.shard_map import smap as smap
@@ -206,41 +207,6 @@ _deprecations = {
   "device_put_sharded": (
     "jax.device_put_sharded is deprecated; use jax.device_put instead.",
     _deprecated_device_put_sharded
-  ),
-  # Finalized 2025-03-25; remove after 2025-06-25
-  "treedef_is_leaf": (
-    "jax.treedef_is_leaf was removed in JAX v0.6.0: use jax.tree_util.treedef_is_leaf.",
-    None
-  ),
-  "tree_flatten": (
-    "jax.tree_flatten was removed in JAX v0.6.0: use jax.tree.flatten (jax v0.4.25 or newer) "
-    "or jax.tree_util.tree_flatten (any JAX version).",
-    None
-  ),
-  "tree_leaves": (
-    "jax.tree_leaves was removed in JAX v0.6.0: use jax.tree.leaves (jax v0.4.25 or newer) "
-    "or jax.tree_util.tree_leaves (any JAX version).",
-    None
-  ),
-  "tree_structure": (
-    "jax.tree_structure was removed in JAX v0.6.0: use jax.tree.structure (jax v0.4.25 or newer) "
-    "or jax.tree_util.tree_structure (any JAX version).",
-    None
-  ),
-  "tree_transpose": (
-    "jax.tree_transpose was removed in JAX v0.6.0: use jax.tree.transpose (jax v0.4.25 or newer) "
-    "or jax.tree_util.tree_transpose (any JAX version).",
-    None
-  ),
-  "tree_unflatten": (
-    "jax.tree_unflatten was removed in JAX v0.6.0: use jax.tree.unflatten (jax v0.4.25 or newer) "
-    "or jax.tree_util.tree_unflatten (any JAX version).",
-    None
-  ),
-  "tree_map": (
-    "jax.tree_map was removed in JAX v0.6.0: use jax.tree.map (jax v0.4.25 or newer) "
-    "or jax.tree_util.tree_map (any JAX version).",
-    None
   ),
 }
 

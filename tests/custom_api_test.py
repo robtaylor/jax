@@ -1472,9 +1472,36 @@ class CustomJVPTest(jtu.JaxTestCase):
       (x, y), (x_dot, y_dot) = primals, tangents
       del y_dot  # ignore lol
       return div(x, y), div(x_dot, y)
-    _, f_vjp = api.vjp3(lambda x: div(x, 2.), 1.)
+    _, f_vjp = api.vjp(lambda x: div(x, 2.), 1.)
     ans, = f_vjp(1.)
     self.assertAllClose(ans, 1./2, check_dtypes=False)
+
+  def test_ensure_compile_time_eval(self):
+    @jax.custom_jvp
+    def f(x):
+      assert x == 0.  # concrete!
+      return x
+    @f.defjvp
+    def f_jvp(primals, tangents):
+      (x,), (x_dot,) = primals, tangents
+      assert x == 0.  # concrete!
+
+    @jax.jit
+    def g():
+      with jax.ensure_compile_time_eval():
+        return f(0.)
+
+    g()  # don't crash
+
+    # TODO(mattjj): do we want to support autodiff here too?
+    # def h(x):
+    #   @jax.jit
+    #   def hh():
+    #     with jax.ensure_compile_time_eval():
+    #       return f(x)
+    #   return hh()
+
+    # jax.grad(h)(0.)  # don't crash
 
 
 class CustomVJPTest(jtu.JaxTestCase):
@@ -2941,7 +2968,7 @@ class CustomVJPTest(jtu.JaxTestCase):
 
     with self.assertRaisesRegex(
         ValueError,
-        r'output\[1\] the bwd rule produced an output of shape/dtype float..\[3\]'):
+        r'output\[1\] the bwd rule produced an output of type float..\[3\]'):
       jax.grad(lambda x, y: foo(x, y * y).sum(), 1)(jnp.ones(3), jnp.ones(4))
 
   def test_bwd_rule_shape_mismatch_disable(self):
@@ -2958,7 +2985,7 @@ class CustomVJPTest(jtu.JaxTestCase):
 
     foo.defvjp(foo_fwd, foo_bwd)
 
-    with config.custom_vjp_disable_shape_check(True):
+    with config.disable_bwd_checks(True):
       jax.grad(lambda x, y: foo(x, y).sum(), 1)(jnp.ones(3), jnp.ones(4))
 
   def test_bwd_rule_can_produce_list_or_tuple(self):
@@ -4564,6 +4591,7 @@ class CustomVmapTest(jtu.JaxTestCase):
     self.assertEqual(str(jaxpr), str(jaxpr_ref))
 
   @parameterized.named_parameters(
+    ("0", 0),
     ("1", 1),
     ("8", 4),
     ("12", 8),
@@ -4580,6 +4608,7 @@ class CustomVmapTest(jtu.JaxTestCase):
     np.testing.assert_array_equal(y, x**2)
 
   @parameterized.named_parameters(
+    ("0", 0),
     ("1", 1),
     ("8", 4),
     ("12", 8),

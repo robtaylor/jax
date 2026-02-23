@@ -722,6 +722,18 @@ def memref_reshape(
         (), ref_ty.element_type, new_layout, ref_ty.memory_space
     )
     return memref.collapse_shape(result_ty, ref, [])
+  # For contiguous refs we can do arbitrary reshapes easily.
+  strides, _ = ref_ty.get_strides_and_offset()
+  if all(
+      d == 1 or s1 == s2
+      for d, s1, s2 in zip(
+          ref_ty.shape,
+          get_contiguous_strides(ref_ty.shape),
+          strides,
+          strict=True,
+      )
+  ):
+    return memref_unfold(memref_fold(ref, 0, ref_ty.rank), 0, shape)
   return _reshape(ref, src_shape, dst_shape)
 
 
@@ -1071,7 +1083,9 @@ class BarrierRef:
     elif ir.IndexType.isinstance(bytes.type):
       i32 = ir.IntegerType.get_signless(32)
       bytes = arith.index_cast(i32, bytes)
-    nvvm.mbarrier_arrive_expect_tx(self.get_ptr(), bytes, predicate=predicate)
+    nvvm_mbarrier_arrive_expect_tx(
+        self.get_ptr(), bytes, predicate=predicate
+    )
 
   def get_ptr(self):
     i64 = ir.IntegerType.get_signless(64)
@@ -1840,7 +1854,7 @@ def is_known_divisible(value, divisor, max_depth=10) -> bool:
   """Returns True if the value is statically known to be divisible by the divisor."""
   if divisor == 1:
     return True
-  if max_depth < 0 or not isinstance(value.owner, ir.Operation):
+  if max_depth < 0 or not isinstance(value.owner, ir.OpView):
     return False
 
   new_depth = max_depth - 1
@@ -1986,3 +2000,10 @@ def nanosleep(nanos: ir.Value):
       "r",
       has_side_effects=True,
   )
+
+
+def nvvm_mbarrier_arrive_expect_tx(barrier: ir.Value, expect_tx: ir.Value, predicate: ir.Value | None = None):
+  try:
+    return nvvm.mbarrier_arrive_expect_tx(None, barrier, expect_tx, predicate=predicate)  # type: ignore
+  except TypeError:
+    return nvvm.mbarrier_arrive_expect_tx(barrier, expect_tx, predicate=predicate)  # pytype: disable=missing-parameter

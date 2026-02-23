@@ -46,6 +46,7 @@ from jax.test_util import check_grads
 from jax._src import array
 from jax._src import config
 from jax._src import core
+from jax._src import deprecations
 from jax._src import dtypes
 from jax._src import test_util as jtu
 from jax._src.lax import lax as lax_internal
@@ -3612,6 +3613,15 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     self._CheckAgainstNumpy(np.iscomplexobj, jnp.iscomplexobj, args_maker)
     self._CompileAndCheck(jnp.iscomplexobj, args_maker)
 
+  @parameterized.parameters(
+      None, bool(1), int(1), float(1), complex(1),
+      np.int32(0), np.float32(1), np.complex64(1),
+      (np.arange(5),)
+  )
+  def testIsComplexObjTransferGuard(self, val):
+    with jax.transfer_guard("disallow"):
+      jnp.iscomplexobj(val)
+
   def testIsClose(self):
     c_isclose = jax.jit(jnp.isclose)
     c_isclose_nan = jax.jit(partial(jnp.isclose, equal_nan=True))
@@ -4869,6 +4879,53 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
     self.assertEqual(len(jaxpr.jaxpr.eqns), num_eqs)
     self.assertEqual(jaxpr.jaxpr.eqns[0].primitive, lax.iota_p)
 
+  @jtu.sample_product(specify_device=[True, False])
+  def testArangeJaxprNonZeroStart(self, specify_device):
+    device = jax.devices()[-1] if specify_device else None
+    jaxpr = jax.make_jaxpr(lambda: jnp.arange(1, 5, device=device))()
+    # Non-zero start should produce iota + add (+ device_put if device specified)
+    num_eqs = 3 if device is not None else 2
+    self.assertEqual(len(jaxpr.jaxpr.eqns), num_eqs)
+    self.assertEqual(jaxpr.jaxpr.eqns[0].primitive, lax.iota_p)
+    self.assertEqual(jaxpr.jaxpr.eqns[1].primitive, lax.add_p)
+
+  @jtu.sample_product(
+      dtype=[np.int32, np.float32],
+      iteration=range(10)
+  )
+  def testArangeRandomValues(self, dtype, iteration):
+    del iteration  # not needed: each test case gets its own random seed.
+    rng = jtu.rand_default(self.rng())
+    start = rng((), dtype)
+    stop = rng((), dtype)
+    jax_result = jnp.arange(start, stop, dtype=dtype)
+    np_result = np.arange(start, stop, dtype=dtype)
+    self.assertAllClose(jax_result, np_result)
+
+  @parameterized.parameters(
+      (1+2j, 5+3j),
+      (0+0j, 5+0j),
+      (1.0+0j, 5.0+0j),
+      (0, 5, 1+1j),
+  )
+  def testArangeComplex(self, *args):
+    dep_id = "jax-numpy-arange-complex"
+    msg = "Passing complex start/stop/step to jnp.arange is deprecated"
+    if deprecations.is_accelerated(dep_id):
+      with self.assertRaisesRegex(ValueError, msg):
+        jax_result = jnp.arange(*args)
+    else:
+      with self.assertWarnsRegex(DeprecationWarning, msg):
+        jax_result = jnp.arange(*args)
+      np_result = np.arange(*args)
+      self.assertArraysEqual(jax_result, np_result)
+
+  @parameterized.parameters(int, float, np.int32, np.float32)
+  def testArangeTransferGuard(self, typ):
+    # Ensure that simple arange calls avoid host-to-device transfer.
+    with jax.transfer_guard("disallow"):
+      jnp.arange(typ(5))
+
   def testIssue830(self):
     a = jnp.arange(4, dtype=jnp.complex64)
     self.assertEqual(a.dtype, jnp.complex64)
@@ -5732,13 +5789,11 @@ class LaxBackedNumpyTests(jtu.JaxTestCase):
       self._CompileAndCheck(jnp.logaddexp2, args_maker, rtol=tol, atol=tol)
 
   def testDefaultDtypes(self):
-    precision = config.default_dtype_bits.value
-    assert precision in ['32', '64']
     self.assertEqual(jnp.bool_, np.bool_)
-    self.assertEqual(jnp.int_, np.int32 if precision == '32' else np.int64)
-    self.assertEqual(jnp.uint, np.uint32 if precision == '32' else np.uint64)
-    self.assertEqual(jnp.float_, np.float32 if precision == '32' else np.float64)
-    self.assertEqual(jnp.complex_, np.complex64 if precision == '32' else np.complex128)
+    self.assertEqual(jnp.int_, np.int64)
+    self.assertEqual(jnp.uint, np.uint64)
+    self.assertEqual(jnp.float_, np.float64)
+    self.assertEqual(jnp.complex_, np.complex128)
 
   def testFromBuffer(self):
     buf = b'\x01\x02\x03'
@@ -6218,43 +6273,6 @@ class NumpySignaturesTest(jtu.JaxTestCase):
             'trapz',
             'typename'}
 
-    # symbols removed in NumPy 2.0
-    skip |= {'add_docstring',
-             'add_newdoc',
-             'add_newdoc_ufunc',
-             'alltrue',
-             'asfarray',
-             'byte_bounds',
-             'compare_chararrays',
-             'cumproduct',
-             'deprecate',
-             'deprecate_with_doc',
-             'disp',
-             'fastCopyAndTranspose',
-             'find_common_type',
-             'get_array_wrap',
-             'geterrobj',
-             'issctype',
-             'issubclass_',
-             'issubsctype',
-             'lookfor',
-             'mat',
-             'maximum_sctype',
-             'msort',
-             'obj2sctype',
-             'product',
-             'recfromcsv',
-             'recfromtxt',
-             'round_',
-             'safe_eval',
-             'sctype2char',
-             'set_numeric_ops',
-             'set_string_function',
-             'seterrobj',
-             'sometrue',
-             'source',
-             'who'}
-
     self.assertEmpty(skip.intersection(dir(jnp)))
 
     names = (name for name in dir(np) if not (name.startswith('_') or name in skip))
@@ -6266,42 +6284,55 @@ class NumpySignaturesTest(jtu.JaxTestCase):
 
     # TODO(jakevdp): fix some of the following signatures. Some are due to wrong argument names.
     unsupported_params = {
+      'arange': ['start_or_stop', 'like'],
+      'array': ['ndmax', 'like', 'subok'],
       'argpartition': ['kind', 'order'],
       'asarray': ['like'],
       'broadcast_to': ['subok'],
       'clip': ['kwargs', 'out'],
+      'concat': ['out', 'dtype', 'casting'],
+      'concatenate': ['out', 'casting'],
       'copy': ['subok'],
       'corrcoef': ['ddof', 'bias'],
       'cumulative_prod': ['out'],
       'cumulative_sum': ['out'],
+      'dot': ['out'],
       'empty_like': ['subok', 'order'],
       'einsum': ['kwargs'],
       'einsum_path': ['einsum_call'],
+      'empty': ['order', 'like'],
       'eye': ['order', 'like'],
       'hstack': ['casting'],
       'identity': ['like'],
       'isin': ['kind'],
       'full': ['order', 'like'],
       'full_like': ['subok', 'order'],
+      'frombuffer': ['like'],
       'fromfunction': ['like'],
+      'frompyfunc': ['kwargs'],
+      'fromstring': ['like'],
       'load': ['mmap_mode', 'allow_pickle', 'fix_imports', 'encoding', 'max_header_size'],
-      'nanpercentile': ['weights'],
-      'nanquantile': ['weights'],
+      'nanpercentile': ['interpolation', 'weights'],
+      'nanquantile': ['interpolation', 'weights'],
       'nanstd': ['correction'],
       'nanvar': ['correction'],
       'ones': ['order', 'like'],
       'ones_like': ['subok', 'order'],
       'partition': ['kind', 'order'],
-      'percentile': ['weights'],
-      'quantile': ['weights'],
+      'percentile': ['interpolation', 'weights'],
+      'promote_types': ['type1', 'type2'],
+      'quantile': ['interpolation', 'weights'],
       'row_stack': ['casting'],
       'stack': ['casting'],
       'tri': ['like'],
+      'unravel_index': ['order'],
       'vstack': ['casting'],
+      'zeros': ['order', 'like'],
       'zeros_like': ['subok', 'order']
     }
 
     extra_params = {
+      'arange': ['start'],
       'compress': ['size', 'fill_value'],
       'einsum': ['subscripts', 'precision'],
       'einsum_path': ['subscripts'],

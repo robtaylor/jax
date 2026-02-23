@@ -360,24 +360,31 @@ GetAssemblyToBinaryCompilationProvider() {
   return (*compilation_provider)->get();
 }
 
+std::string CUDAErrorString(CUresult result) {
+  const char* error;
+  cuGetErrorString(result, &error);
+  return error;
+}
+// Returns if the CUDA expression returns an error.
+#define CUDA_RETURN_IF_ERROR(stmt)                         \
+  do {                                                     \
+    if (CUresult result = stmt; result != CUDA_SUCCESS) {  \
+      return absl::InternalError(CUDAErrorString(result)); \
+    }                                                      \
+  } while (0)
+
 absl::StatusOr<se::CudaComputeCapability> GetCudaComputeCapability() {
   // Assumes driver has been initialized and a context exists. XLA already has
   // some utilities to query this, but we try to stay runtime-agnostic, so we
   // build our own here.
   CUdevice device;
-  if (cuCtxGetDevice(&device) != CUDA_SUCCESS) {
-    return absl::InternalError("Failed to get device for current context");
-  }
+  CUDA_RETURN_IF_ERROR(cuCtxGetDevice(&device));
   int major = 0;
-  if (cuDeviceGetAttribute(&major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
-                           device) != CUDA_SUCCESS) {
-    return absl::InternalError("Failed to get major compute capability");
-  }
+  CUDA_RETURN_IF_ERROR(cuDeviceGetAttribute(
+      &major, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, device));
   int minor = 0;
-  if (cuDeviceGetAttribute(&minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
-                           device) != CUDA_SUCCESS) {
-    return absl::InternalError("Failed to get minor compute capability");
-  }
+  CUDA_RETURN_IF_ERROR(cuDeviceGetAttribute(
+      &minor, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, device));
 
   TF_ASSIGN_OR_RETURN(std::string sm, mosaic::gpu::GetSmVersion(major, minor));
   bool has_accelerated_features = absl::EndsWith(sm, "a");
@@ -641,9 +648,10 @@ absl::StatusOr<CompiledKernel*> CachedCompileAndInit(CacheKey key,
   return &cache.kernels.at(key);
 }
 
+// TODO(b/464203195): Backward-compatible version using the legacy FFI
+// API. Remove once backward compatibility window has passed.
 void MosaicGPUCustomCall(void* stream, void** buffers, char* opaque,
                          size_t opaque_len, XlaCustomCallStatus* status) {
-  // Forward-compatible version using the legacy FFI API
   if (reinterpret_cast<uintptr_t>(opaque) % alignof(KernelHash)) {
     fprintf(stderr, "Misaligned opaque pointer\n");
     abort();
@@ -680,8 +688,6 @@ absl::Status MosaicGpuExecute(cudaStream_t stream, ffi::RemainingArgs inputs,
                               std::string_view kernel_hash,
                               std::string_view module,
                               bool use_custom_barrier) {
-  // Updated version using the new FFI API supporting custom barrier
-  // for distributed kernels
   if (use_custom_barrier) {
     return absl::UnimplementedError("Custom barrier is not supported on GPUs.");
   }
@@ -693,12 +699,7 @@ absl::Status MosaicGpuExecute(cudaStream_t stream, ffi::RemainingArgs inputs,
   KernelHash hash;
   std::memcpy(hash.data(), kernel_hash.data(), sizeof(KernelHash));
   CUcontext ctx;
-  if (auto result = cuCtxGetCurrent(&ctx); result != CUDA_SUCCESS) {
-    const char* error;
-    cuGetErrorString(result, &error);
-    return absl::InternalError(
-        absl::StrFormat("Failed to get current CUDA context: %s", error));
-  }
+  CUDA_RETURN_IF_ERROR(cuCtxGetCurrent(&ctx));
   CacheKey key(hash, reinterpret_cast<uintptr_t>(ctx));
   TF_ASSIGN_OR_RETURN(auto compiled_kernel,
                       CachedCompileAndInit(key, module));

@@ -25,7 +25,6 @@ import jax.numpy as jnp
 from jax._src import config
 from jax._src import core
 from jax._src import dispatch
-from jax._src import deprecations
 from jax._src import op_shardings
 from jax._src import test_util as jtu
 from jax._src import xla_bridge as xb
@@ -882,6 +881,13 @@ class JaxArrayTest(jtu.JaxTestCase):
       jax.make_array_from_single_device_arrays(
           shape, s, [arr], dtype=jnp.float32)
 
+  @jtu.with_explicit_mesh((2,), ('x',))
+  def test_unreduced_printing(self, mesh):
+    x = jax.device_put(jnp.arange(8., dtype='float32'), P('x'))
+    x = jax.lax.reduce_sum(x, [0], out_sharding=P(unreduced={'x'}))
+    self.assertIn('nreduced', str(x.sharding))
+    self.assertIn('Array(shape=(), dtype=float32, sharding=', str(x))
+
 
 class ShardingTest(jtu.JaxTestCase):
 
@@ -1338,13 +1344,8 @@ class ShardingTest(jtu.JaxTestCase):
     mesh2 = jax.sharding.AbstractMesh((2,), 'x', axis_types=Auto)
     self.assertEqual(mesh1, mesh2)
 
-    if deprecations.is_accelerated('jax-make-mesh-default-explicit'):
-      mesh = jax.make_mesh((1, 1), ('x', 'y'))
-      self.assertTupleEqual(mesh.axis_types, (AxisType.Explicit,) * 2)
-    else:
-      mesh = jax.make_mesh((1, 1), ('x', 'y'),
-                          axis_types=(AxisType.Explicit,) * 2)
-      self.assertTupleEqual(mesh.axis_types, (AxisType.Explicit,) * 2)
+    mesh = jax.make_mesh((1, 1), ('x', 'y'))
+    self.assertTupleEqual(mesh.axis_types, (AxisType.Explicit,) * 2)
 
     mesh = jax.make_mesh((1, 1, 1), ('x', 'y', 'z'),
                          axis_types=(Explicit, Auto, Manual))
@@ -1393,11 +1394,8 @@ class ShardingTest(jtu.JaxTestCase):
     out = aval.update(sharding=NamedSharding(mesh, P(('a', 'b'), 'c', 'd')))
     self.assertEqual(out.sharding.spec, P(('a', 'b'), None, None, None))
 
-    with self.assertRaisesRegex(
-        ValueError,
-        'Tuple subset of `PartitionSpec` cannot contain `Manual` mixed with'
-        ' `Auto` or `Explicit`'):
-      aval.update(sharding=NamedSharding(mesh, P(('a', 'd'), 'b', 'c')))
+    out = aval.update(sharding=NamedSharding(mesh, P(('a', 'd'), 'b', 'c')))
+    self.assertEqual(out.sharding.spec, P('a', 'b', None, None))
 
   def test_aval_str_short(self):
     mesh = AbstractMesh(
@@ -1571,15 +1569,6 @@ class ShardingTest(jtu.JaxTestCase):
         ValueError,
         "A tuple inside PartitionSpec cannot contain a nested tuple"):
       jax.P((('a', 'b'), 'c'))
-
-  def test_make_mesh_accelerate_explicit(self):
-    if deprecations.is_accelerated('jax-make-mesh-default-explicit'):
-      mesh = jax.make_mesh((1,), 'x')
-      self.assertTupleEqual(mesh.axis_types, (AxisType.Explicit,))
-    else:
-      with self.assertWarnsRegex(DeprecationWarning, "The default axis_types"):
-        mesh = jax.make_mesh((1,), 'x')
-        self.assertTupleEqual(mesh.axis_types, (AxisType.Auto,))
 
 
 class RngShardingTest(jtu.JaxTestCase):

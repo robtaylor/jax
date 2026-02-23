@@ -14,6 +14,7 @@
 
 import functools
 from absl.testing import absltest
+from absl.testing import parameterized
 import jax
 from jax._src import test_util as jtu
 from jax._src.state.primitives import pin, unpin
@@ -118,8 +119,8 @@ class PallasCallStatefulTest(jtu.JaxTestCase):
 
       x = pl.pallas_call(
           functools.partial(copy_kernel, x_ref, y_ref),
-          in_specs=[pl.BlockSpec(memory_space=pltpu.ANY)],
-          out_specs=pl.BlockSpec(memory_space=pltpu.ANY),
+          in_specs=[pl.BlockSpec(memory_space=pl.ANY)],
+          out_specs=pl.BlockSpec(memory_space=pl.ANY),
           scratch_shapes=[pltpu.SemaphoreType.DMA],
           out_shape=jax.ShapeDtypeStruct(x_ref.shape, x_ref.dtype),
           input_output_aliases={0: 0},
@@ -272,6 +273,24 @@ class CoreMapTest(jtu.JaxTestCase):
       "Attempted to lower core_map without discharging."):
       f(x)
 
+  def test_can_signal_cores(self):
+    @jax.jit
+    def f(x):
+      x_ref = jax.new_ref(x)
+      y_ref = jax.new_ref(jnp.empty_like(x))
+      @pl.core_map(pltpu.create_tensorcore_mesh("x"))
+      def _():
+        @functools.partial(pl.run_scoped, sem=pltpu.SemaphoreType.REGULAR)
+        def inner(sem):
+          s = jax.lax.axis_size("x")
+          for i in range(s):
+            pl.semaphore_signal(sem, device_id={"x": i})
+          pl.semaphore_wait(sem, s)
+          pltpu.sync_copy(x_ref, y_ref)
+      return jax.freeze(y_ref)
+    x = jnp.arange(8 * 128, dtype=jnp.int32).reshape((8, 128))
+    np.testing.assert_array_equal(f(x), x)
+
   def test_can_query_core_index(self):
     mesh = pltpu.create_tensorcore_mesh("x")
     slc_size = 16 // mesh.shape["x"]
@@ -324,8 +343,37 @@ class CoreMapTest(jtu.JaxTestCase):
       return kernel(x)
 
     x = jnp.arange(8 * 128, dtype=jnp.int32).reshape((8, 128))
-    with self.assertRaisesRegex(Exception, "core_map .* captures constants"):
+    with self.assertRaisesRegex(
+        Exception, "core_map .* captures non-scalar constants"
+    ):
       f(x)
+
+  def test_capture_scalar(self):
+    @jax.jit
+    def f(x, i):
+      @pl.kernel(out_shape=jax.ShapeDtypeStruct(x.shape[1:], jnp.int32),
+                 mesh=pltpu.create_tensorcore_mesh("x", num_cores=1))
+      def kernel(x_ref, out_ref):
+        pltpu.sync_copy(x_ref.at[i], out_ref)
+      return kernel(x)
+
+    x = jnp.arange(4 * 8 * 128, dtype=jnp.int32).reshape((4, 8, 128))
+    for i in range(x.shape[0]):
+      out = f(x, i)
+      np.testing.assert_array_equal(out, x[i])
+
+    @jax.jit
+    def g(x, i):
+      @pl.kernel(out_shape=jax.ShapeDtypeStruct((2, *x.shape[1:]), jnp.int32),
+                 mesh=pltpu.create_tensorcore_mesh("x", num_cores=1))
+      def kernel(x_ref, out_ref):
+        pltpu.sync_copy(x_ref.at[pl.ds(i, 2)], out_ref)
+      return kernel(x)
+
+    x = jnp.arange(4 * 8 * 128, dtype=jnp.int32).reshape((4, 8, 128))
+    for i in range(3):
+      out = g(x, i)
+      np.testing.assert_array_equal(out, x[i:i+2])
 
   def test_kernel_helper_with_scratch(self):
     mesh = pltpu.create_tensorcore_mesh("x")
@@ -352,6 +400,28 @@ class CoreMapTest(jtu.JaxTestCase):
         scratch_shapes=[pltpu.VMEM(x.shape, x.dtype)])(x)
     np.testing.assert_array_equal(result1, x)
     np.testing.assert_array_equal(result2, x + 1)
+
+  @parameterized.named_parameters(
+      ("HBM", pltpu.HBM, 0),
+      ("VMEM", pltpu.VMEM, 1),
+      ("SMEM", pltpu.SMEM, 4),
+      ("SEMAPHORE", pltpu.SEMAPHORE, 2),
+  )
+  def test_kernel_with_output_memory_space(self, memory_space, color):
+    if not jtu.is_device_tpu_at_least(5):
+      self.skipTest("Only supported on TPU v5+")
+    mesh = pltpu.create_tensorcore_mesh("x", num_cores=1)
+    def body(x_ref, o_ref):
+      pltpu.sync_copy(x_ref, o_ref)
+    x = jnp.arange(8 * 128, dtype=jnp.int32).reshape((8, 128))
+    text = pl.kernel(
+        body, out_shape=memory_space(x.shape, x.dtype), mesh=mesh,
+    ).lower(x).as_text()
+    custom_call = [l for l in text.split("\n") if "@tpu_custom_call" in l]
+    self.assertLen(custom_call, 1)
+    custom_call = custom_call[0]
+    self.assertRegex(custom_call,
+                     r".*output_memory_colors\\22: \[" + str(color) + r"\].*")
 
 
 if __name__ == "__main__":

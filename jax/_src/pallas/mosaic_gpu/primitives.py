@@ -53,6 +53,7 @@ import jax.numpy as jnp
 import numpy as np
 
 
+AxisName = jax_core.AxisName
 WARP_SIZE = 32
 WARPGROUP_SIZE = 128
 
@@ -248,14 +249,32 @@ def _copy_smem_to_gmem_lowering(
         "GMEM refs with peer ids are not supported in warpgroup lowering."
     )
   assert not copy_params.get("gmem_transform")
-  mgpu.dialect.async_store(
-      src,
-      dst,
-      indices,
-      slice_lengths,
-      predicate=predicate,
-      commit_group=commit_group,  # type: ignore[call-arg]
-  )
+  if reduction_op is not None:
+    # TODO(b/415721295): Call mgpu.dialect.async_store after the if, after
+    # the minimal jaxlib version is 0.8.2.
+    if not hasattr(mgpu.dialect, "TMAReduction"):
+      raise NotImplementedError("Reduction op is not supported yet.")
+    reduction_op_attr = getattr(
+        mgpu.dialect.TMAReduction, reduction_op.capitalize()
+    )
+    mgpu.dialect.async_store(
+        src,
+        dst,
+        indices,
+        slice_lengths,
+        predicate=predicate,
+        commit_group=commit_group,  # type: ignore[call-arg]
+        reduction_op=reduction_op_attr,
+    )
+  else:
+    mgpu.dialect.async_store(
+        src,
+        dst,
+        indices,
+        slice_lengths,
+        predicate=predicate,
+        commit_group=commit_group,  # type: ignore[call-arg]
+    )
   return ()
 
 
@@ -3184,7 +3203,10 @@ def _async_store_tmem_lowering_rule_wg(
 async_copy_scales_to_tmem_p = jax_core.Primitive("async_copy_scales_to_tmem")
 async_copy_scales_to_tmem_p.multiple_results = True
 
-def async_copy_scales_to_tmem(smem_ref: _Ref, tmem_ref: _Ref):
+
+def async_copy_scales_to_tmem(
+    smem_ref: _Ref, tmem_ref: _Ref, collective_axis: AxisName | None = None,
+):
   """Copies the MMA scales from SMEM to TMEM.
 
   The copy is performed asynchronously and can be awaited by calling
@@ -3208,12 +3230,17 @@ def async_copy_scales_to_tmem(smem_ref: _Ref, tmem_ref: _Ref):
   async_copy_scales_to_tmem_p.bind(
       smem_ref, tmem_ref, *flat_smem_transforms, *flat_tmem_transforms,
       smem_tree=smem_transforms_treedef, tmem_tree=tmem_transforms_treedef,
+      collective_axis=collective_axis,
   )
+
 
 async_copy_sparse_metadata_to_tmem_p = jax_core.Primitive("async_copy_sparse_metadata_to_tmem")
 async_copy_sparse_metadata_to_tmem_p.multiple_results = True
 
-def async_copy_sparse_metadata_to_tmem(smem_ref: _Ref, tmem_ref: _Ref):
+
+def async_copy_sparse_metadata_to_tmem(
+    smem_ref: _Ref, tmem_ref: _Ref, collective_axis: AxisName | None = None
+):
   """Copies the MMA sparse metadata from SMEM to TMEM.
 
   The copy is performed asynchronously and can be awaited by calling
@@ -3237,11 +3264,13 @@ def async_copy_sparse_metadata_to_tmem(smem_ref: _Ref, tmem_ref: _Ref):
   async_copy_sparse_metadata_to_tmem_p.bind(
       smem_ref, tmem_ref, *flat_smem_transforms, *flat_tmem_transforms,
       smem_tree=smem_transforms_treedef, tmem_tree=tmem_transforms_treedef,
+      collective_axis=collective_axis,
   )
+
 
 @async_copy_scales_to_tmem_p.def_effectful_abstract_eval
 @async_copy_sparse_metadata_to_tmem_p.def_effectful_abstract_eval
-def _async_copy_to_tmem_abstract_eval(smem_ref, tmem_ref, *avals_flat, smem_tree, tmem_tree):
+def _async_copy_to_tmem_abstract_eval(smem_ref, tmem_ref, *_args, **_kwargs):
   if smem_ref.memory_space != gpu_core.MemorySpace.SMEM:
     raise ValueError("async_copy_scales_to_tmem source must be an SMEM ref")
   if tmem_ref.memory_space != gpu_core.MemorySpace.TMEM:
@@ -3249,7 +3278,7 @@ def _async_copy_to_tmem_abstract_eval(smem_ref, tmem_ref, *avals_flat, smem_tree
   return (), {gpu_core._memory_effect}
 
 def _async_copy_to_tmem_lowering_rule(
-    impl, ctx: lowering.LoweringRuleContext, smem_ref, tmem_ref, *leaves, smem_tree, tmem_tree
+    impl, ctx: lowering.LoweringRuleContext, smem_ref, tmem_ref, *leaves, smem_tree, tmem_tree, collective_axis
 ):
   assert isinstance(tmem_ref, tcgen05.TMEMRef)
   smem_leaves, tmem_leaves = util.split_list(leaves, [smem_tree.num_leaves])
@@ -3261,8 +3290,17 @@ def _async_copy_to_tmem_lowering_rule(
     raise NotImplementedError(f"Unimplemented transforms for SMEM refs: {smem_transforms}")
   if tmem_transforms:
     raise NotImplementedError(f"Unimplemented transforms for TMEM refs: {tmem_transforms}")
-  with mgpu.when(ctx.module_ctx.single_lane_predicate):
-    impl(smem_ref, tmem_ref)
+
+  predicate = ctx.module_ctx.single_lane_predicate
+  if collective_axis is not None:
+    is_leader_block = _collective_mma_predicate(ctx, collective_axis)
+    predicate = arith_dialect.andi(predicate, is_leader_block)
+    collective = True
+  else:
+    collective = False
+
+  with mgpu.when(predicate):
+    impl(smem_ref, tmem_ref, collective=collective)
   return ()
 
 @lowering.register_lowering_rule(

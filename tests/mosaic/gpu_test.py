@@ -394,6 +394,7 @@ class MemRefTest(TestCase):
       ("un", (1, 10, 1), (1, 5, 2, 1,)),
       ("to_scalar", (1, 1, 1), ()),
       ("from_scalar", (), (1, 1, 1)),
+      ("arbitrary", (2 * 5, 7 * 3), (2, 7, 5, 3)),
   )
   def test_reshape(self, inp_shape, out_shape):
     def kernel(ctx, inp, out, _):
@@ -1759,11 +1760,10 @@ class TCGen05Test(TestCase):
 
   @parameterized.product(
     m=(256,),
-    n=(64, 128, 256),
+    n=(128, 256),
     scale_jax_dtype=(jnp.float8_e8m0fnu, jnp.float8_e4m3fn),
   )
   def test_mma_block_scaled_collective(self, m, n, scale_jax_dtype):
-    m, n = 256, 256
     in_jax_dtype = jnp.float4_e2m1fn
     out_jax_dtype = jnp.float32
     scale_block = 32 if scale_jax_dtype == jnp.float8_e8m0fnu else 16
@@ -3796,21 +3796,95 @@ class FragmentedArrayTest(TestCase):
     )(inp)
     np.testing.assert_array_equal(result, inp)
 
-  @parameterized.parameters((128, 128), (128, 64), (64, 128))
-  def test_broadcast_major(self, m, n):
+  @parameterized.parameters(
+      (128, 128), (64, 128), (64, 256)
+  )
+  def test_broadcast_in_dim_major_strided(self, m, n):
+    dtype = jnp.float16
     def kernel(ctx, gmem_input, gmem_output, _):
-      t = mgpu.FragmentedArray.load_untiled(
-          gmem_input, layout=mgpu.WGMMA_COL_LAYOUT, optimized=False
+      t = mgpu.FragmentedArray.load_strided(
+          gmem_input, vec_size=1
       )
-      t.broadcast_in_dim((m, n), (1,), mgpu.WGMMA_LAYOUT).store_untiled(gmem_output, optimized=False)
+      t.broadcast_in_dim((m, n), (1,),
+          mgpu.WGStridedFragLayout(shape=(m, n), vec_size=1),
+      ).store_untiled(gmem_output, optimized=False)
 
-    inp = self.prng.uniform(-1, 1, (n,)).astype(jnp.float16)
-    out_shape = jax.ShapeDtypeStruct((m, n), jnp.float16)
+    inp = self.prng.uniform(-1, 1, (n,)).astype(dtype)
+    out_shape = jax.ShapeDtypeStruct((m, n), dtype)
     result = mgpu.as_gpu_kernel(
         kernel, (1, 1, 1), (128, 1, 1), (inp,), out_shape, inp
     )(inp)
     out_ref = jax.lax.broadcast_in_dim(inp, (m, n), (1,))
     np.testing.assert_array_equal(result, out_ref)
+
+  @parameterized.parameters(
+      (128, 128), (128, 64), (64, 128)
+  )
+  def test_broadcast_in_dim_major_wgmma(self, m, n):
+    dtype = jnp.float16
+
+    def kernel(ctx, gmem_input, gmem_output, _):
+      t = mgpu.FragmentedArray.load_untiled(
+          gmem_input, layout=mgpu.WGMMA_COL_LAYOUT, optimized=False
+      )
+      t.broadcast_in_dim(
+          (m, n), (1,), mgpu.WGMMA_LAYOUT
+      ).store_untiled(gmem_output, optimized=False)
+
+    inp = self.prng.uniform(-1, 1, (n,)).astype(dtype)
+    out_shape = jax.ShapeDtypeStruct((m, n), dtype)
+    result = mgpu.as_gpu_kernel(
+        kernel, (1, 1, 1), (128, 1, 1), (inp,), out_shape, inp
+    )(inp)
+    out_ref = jax.lax.broadcast_in_dim(inp, (m, n), (1,))
+    np.testing.assert_array_equal(result, out_ref)
+
+  @parameterized.parameters(
+      ((128), (4, 128)),
+      ((1, 128), (2, 128)),
+      ((1, 128), (4, 128)),
+      ((1, 256), (2, 256)),
+      ((128, ), (1, 3, 1, 2, 4, 128)),
+      ((1, 1, 128,), (1, 3, 1, 2, 4, 128)),
+      ((1, 1, 1, 1, 1, 128,), (1, 3, 1, 2, 4, 128)),
+      ((2, 4, 128,), (1, 3, 1, 2, 4, 128)),
+      ((1, 1, 1, 2, 4, 128,), (1, 3, 1, 2, 4, 128)),
+      ((2, 8, 8), (2, 8, 8)),
+  )
+  def test_broadcast_major_strided(self, in_shape, out_shape):
+    dtype = jnp.float16
+    def kernel(ctx, gmem_input, gmem_output, _):
+      t = mgpu.FragmentedArray.load_strided(gmem_input, vec_size=1)
+      t.broadcast(out_shape).store_untiled(gmem_output, optimized=False)
+    inp = self.prng.uniform(-1, 1, in_shape).astype(dtype)
+    result = mgpu.as_gpu_kernel(
+        kernel, (1, 1, 1), (128, 1, 1), (inp,), jax.ShapeDtypeStruct(out_shape, dtype), inp
+    )(inp)
+    np.testing.assert_array_equal(result, jnp.broadcast_to(inp, out_shape))
+
+  @parameterized.parameters(*mtu.RegisterLayout)
+  def test_broadcast_splat(self, layout):
+    out_shape = (128, 128)
+
+    def body(ctx, out_ref, scratch):
+      del ctx, scratch
+      c42 = arith.constant(ir.IntegerType.get_signless(32), 42)
+      arr = mgpu.FragmentedArray.splat(c42, (128,), is_signed=True)
+      out_layout = layout.to_mgpu(out_shape, jnp.int32)
+      result = arr.broadcast_in_dim(out_shape, (0,), out_layout)
+      result.store_untiled(out_ref, optimized=False)
+
+    kernel = mgpu.as_gpu_kernel(
+        body,
+        grid=(1, 1, 1),
+        block=(128, 1, 1),
+        in_shape=(),
+        out_shape=jax.ShapeDtypeStruct(out_shape, jnp.int32),
+        smem_scratch_shape=[],
+    )
+    np.testing.assert_array_equal(
+        kernel(), np.full(out_shape, 42, dtype=np.int32)
+    )
 
   def test_warp_tree_reduce(self):
     def kernel(ctx, out, *_):
@@ -4097,6 +4171,28 @@ class FragmentedArrayTest(TestCase):
         kernel, (1, 1, 1), (128, 1, 1), x, x, scratch_shape
     )(x)
     np.testing.assert_array_equal(y, x)
+
+  @parameterized.parameters(
+      ((32, 32), (0, 5)),
+      ((32, 128), (3,)),
+      ((32, 32, 128), (slice(1, 3), 0)),
+  )
+  def test_splat_indexing(self, shape, indices):
+    def _kernel(ctx, out_ref, scratch):
+      del ctx, scratch
+      splat = mgpu.FragmentedArray.splat(c(1.0, ir.F32Type.get()), shape)
+      splat[indices].store_untiled(out_ref)
+
+    expected = np.ones(shape, dtype=jnp.float32)[indices]
+    kernel = mgpu.as_gpu_kernel(
+        _kernel,
+        grid=(1, 1, 1),
+        block=(128, 1, 1),
+        in_shape=(),
+        out_shape=expected,
+        smem_scratch_shape=(),
+    )
+    np.testing.assert_array_equal(kernel(), expected)
 
 
 class ProfilerTest(TestCase, jtu.JaxTestCase):
@@ -5267,10 +5363,10 @@ class MosaicGpuDialectTest(TestCase, jtu.JaxTestCase):
     self.assertArraysEqual(kernel(), expected)
 
   @parameterized.parameters(
-      ((4, 64, 128), [[0], [1], [2]], (4, 64, 128), False),
-      ((4, 64, 128), [[0], [1, 2], [3]], (4, 4, 16, 128), False),
-      ((4, 8, 16, 128), [[0], [1], [2, 3], [4]], (4, 8, 2, 8, 128), False),
-      ((4, 64, 128), [[0, 1], [2], [3]], (2, 2, 64, 128), True),
+      ((4, 64, 64), [[0], [1], [2]], (4, 64, 64), False),
+      ((4, 64, 64), [[0], [1, 2], [3]], (4, 4, 16, 64), False),
+      ((4, 8, 16, 64), [[0], [1], [2, 3], [4]], (4, 8, 2, 8, 64), False),
+      ((4, 64, 64), [[0, 1], [2], [3]], (2, 2, 64, 64), True),
   )
   def test_memref_expand_shape(
       self, input_shape, reassociation, output_shape, has_transforms
@@ -5345,6 +5441,124 @@ class MosaicGpuDialectTest(TestCase, jtu.JaxTestCase):
     )
     x = self.prng.uniform(0, 10, input_shape).astype(el_type)
     self.assertArraysEqual(kernel(x), x.reshape(output_shape))
+
+  @parameterized.product(
+      dtype=(jnp.int32, jnp.int64, jnp.uint32, jnp.uint64, jnp.float32, jnp.float16, jnp.bfloat16),
+      reduction_op=("add", "min", "max", "inc", "dec", "and", "or", "xor"),
+  )
+  def test_async_store_reduction(self, dtype, reduction_op):
+
+    if not config.enable_x64.value and dtype in (jnp.int64, jnp.uint64):
+      self.skipTest("x64 support is disabled")
+
+    # TODO(b/415721295):Clean up after the minimal jaxlib version is 0.8.2.
+    if not hasattr(mgpu_dialect, "TMAReduction"):
+      self.skipTest("The mgpu_dialect.TMAReduction attribute is required.")
+
+    if reduction_op in ("min", "max"):
+      if dtype in (jnp.int32, jnp.int64):
+        reduction_op = "s" + reduction_op
+      elif dtype in (jnp.uint32, jnp.uint64):
+        reduction_op = "u" + reduction_op
+
+    if reduction_op in ("smin", "smax", "umin", "umax") and not hasattr(mgpu_dialect.TMAReduction, "Smin"):
+      self.skipTest("The Smin/Smax/Umin/Umax reduction types are required.")
+
+    if (
+        not launch_context._is_tma_reduction_op_supported(
+            reduction_op,
+            utils.dtype_to_ir_type(dtype),
+        )
+        or (
+            dtype in (jnp.uint32, jnp.uint64)
+            and reduction_op in ("smin", "smax")
+        )
+        or (
+            dtype in (jnp.int32, jnp.int64) and reduction_op in ("umin", "umax")
+        )
+        or dtype == jnp.int32 and reduction_op in ("inc", "dec")
+    ):
+      self.skipTest("TMA does not support this reduction op for this dtype")
+
+    shape = (8, 128)
+
+    def body(ctx, src, dst, smem):
+      del ctx
+      src_smem_ref, tma_barrier = smem
+      i32 = ir.IntegerType.get_signless(32)
+      zero = arith.constant(i32, 0)
+      indices = [zero, zero]
+      slice_lengths = src_smem_ref.type.shape
+
+      tma_barrier.arrive_expect_tx(
+          utils.bitwidth(src_smem_ref.type.element_type) * math.prod(shape) // 8
+      )
+
+      mgpu_dialect.async_load(
+          source=src,
+          destination=src_smem_ref,
+          barrier=tma_barrier.as_barrier_memref(),
+          indices=indices,
+          slice_lengths=slice_lengths,
+          collective=ir.ArrayAttr.get([]),
+      )
+
+      tma_barrier.wait()
+
+      reduction_attr = getattr(
+          mgpu_dialect.TMAReduction, reduction_op.capitalize()
+      )
+
+      mgpu_dialect.async_store(
+          source=src_smem_ref,
+          destination=dst,
+          indices=indices,
+          slice_lengths=slice_lengths,
+          reduction_op=reduction_attr,
+      )
+      nvvm.cp_async_bulk_wait_group(0)
+
+    prng_key = jax.random.key(1234)
+    k0, k1 = jax.random.split(prng_key, 2)
+    if dtype in (jnp.bfloat16, jnp.float16, jnp.float32):
+      src = jax.random.uniform(k0, shape, dtype, -10, 10)
+      dst = jax.random.uniform(k1, shape, dtype, -10, 10)
+    else:
+      src = jax.random.randint(k0, shape, -10, 10).astype(dtype)
+      dst = jax.random.randint(k1, shape, -10, 10).astype(dtype)
+
+    if reduction_op == "add":
+      expected = src + dst
+    elif reduction_op in ("min", "smin", "umin"):
+      expected = jnp.minimum(src, dst)
+    elif reduction_op in ("max", "smax", "umax"):
+      expected = jnp.maximum(src, dst)
+    elif reduction_op == "and":
+      expected = src & dst
+    elif reduction_op == "or":
+      expected = src | dst
+    elif reduction_op == "xor":
+      expected = src ^ dst
+    elif reduction_op == "inc":
+      expected = jnp.where(dst >= src, 0, dst + 1)
+    elif reduction_op == "dec":
+      expected = jnp.where((dst == 0) | (dst > src), src, dst - 1)
+    else:
+      raise ValueError(f"Unsupported reduction op: {reduction_op}")
+
+    jax_shape = jax.ShapeDtypeStruct(shape, dtype)
+    kernel = mgpu.as_gpu_kernel(
+        body,
+        grid=(1, 1, 1),
+        block=(128, 1, 1),
+        in_shape=(jax_shape),
+        out_shape=(),
+        inout_shape=(jax_shape,),
+        smem_scratch_shape=[jax_shape, core.TMABarrier(1)],
+        thread_semantics=mgpu.LoweringSemantics.Warpgroup,
+    )
+
+    np.testing.assert_array_equal(kernel(src, dst)[0], expected)
 
 
 class MosaicGpuDialectSm90ATest(Sm90ATestCase, jtu.JaxTestCase):

@@ -416,12 +416,20 @@ class JitTest(jtu.BufferDonationTestCase):
   # Jit and Donate arguments
 
   def test_donate_argnames_signature_fail(self):
+    class NoSignature:
+      @property
+      def __signature__(self):
+        raise TypeError("no signature")
+      def __call__(self, *args, **kwargs):
+        return None
+    fun = NoSignature()
+
     inp = np.arange(4)
     with self.assertRaisesRegex(
         ValueError,
         "Getting the signature of function.*failed. Pass donate_argnums "
         "instead of donate_argnames."):
-      jax.jit(np.dot, donate_argnames='a')(inp, inp)
+      jax.jit(fun, donate_argnames='a')(inp, inp)
 
   @parameterized.named_parameters(
       ("argnums", "donate_argnums", (0, 1)),
@@ -3093,7 +3101,7 @@ class APITest(jtu.JaxTestCase):
   def test_grad_of_bool_vjp3(self):
     def cond(pred):
       return lax.cond(pred, lambda _: 1., lambda _: 2., 1.)
-    value, f_vjp = api.vjp3(cond, True)
+    value, f_vjp = api.vjp(cond, True)
     grd, = f_vjp(1.)
     self.assertEqual(value, 1.)
     self.assertEqual(grd, np.zeros(shape=(), dtype=float0))
@@ -3204,6 +3212,12 @@ class APITest(jtu.JaxTestCase):
     for j, j_module in collection:
       self.assertNotRegex(str(j_module),
        f"stablehlo.constant dense.*tensor<{const_size}x")
+
+  def test_basic_vjp3(self):
+    f = jax.jit(lambda x: jnp.sin(jnp.sin(x)))
+    _, f_vjp = jax.vjp(f, 1.)
+    g, = f_vjp(1.0)
+    self.assertAllClose(g, jnp.cos(jnp.sin(1.)) * jnp.cos(1.), check_dtypes=False)
 
   def test_constants_not_in_lowering_scan(self):
     if not config.use_simplified_jaxpr_constants.value:
@@ -4174,7 +4188,7 @@ class APITest(jtu.JaxTestCase):
 
     x = jnp.array(1)
     a = AlexArray(x)
-    for f in [jnp.isscalar, jnp.size, jnp.shape, jnp.dtype]:
+    for f in [jnp.isscalar, jnp.size, jnp.shape, jnp.result_type]:
       self.assertEqual(f(x), f(a))
 
     x = AlexArray(jnp.array(1))
@@ -5126,37 +5140,6 @@ class APITest(jtu.JaxTestCase):
     jtu.check_grads(f, (list(jnp.arange(float(num_args))),), order=1,
                     modes=['rev'], atol=1e-3, rtol=1e-3)
 
-  @jtu.run_on_devices("cpu")
-  def test_inner_jit_forwarding_happens(self):
-    if not config.dynamic_shapes.value:
-      self.skipTest("Only works for dynamic shapes")
-    jaxpr = jax.make_jaxpr(lambda: jax.jit(lambda x: x)(3))()
-    self.assertLen(jaxpr.jaxpr.outvars, 1)
-    self.assertIsInstance(jaxpr.jaxpr.outvars[0], core.Literal)
-    self.assertEqual(jaxpr.jaxpr.outvars[0].val, 3)
-
-  @parameterized.parameters(range(8))
-  @jtu.run_on_devices("cpu")
-  def test_inner_jit_forwarding_correctness(self, num_input_fwd):
-    if not config.dynamic_shapes.value:
-      self.skipTest("Only works for dynamic shapes")
-    num_args = 8
-    rng = np.random.RandomState(0)
-
-    @jax.jit
-    def f(inputs):
-      inputs = [inputs[i] for i in rng.permutation(num_args)]
-      outputs = (inputs[:num_input_fwd] +
-                 [jnp.sin(inputs[i]) for i in range(num_args - num_input_fwd)])
-      return [outputs[i] for i in rng.permutation(num_args)]
-
-    f2 = jax.jit(f)
-    inputs = list(jnp.arange(float(num_args)))
-    expected = f(inputs)
-    ans = f2(inputs)
-    for a, b in zip(ans, expected):
-      self.assertAllClose(a, b)
-
   @unittest.skip # TODO(dougalm): figure out with Matt what to do with this feature
   def test_inner_jit_forwarded_consts_stay_const(self):
     out = jax.jit(lambda: int(jax.jit(lambda x: x)(3)))()  # don't crash
@@ -5373,6 +5356,14 @@ class APITest(jtu.JaxTestCase):
       return x
 
     jax.vmap(f)(jnp.arange(3.))  # don't crash
+
+  def test_sharding_attr_on_tracer_error(self):
+    @jax.jit
+    def f(x):
+      with self.assertRaisesRegex(AttributeError, 'typeof'):
+        x.sharding
+
+    f(jnp.arange(2.))
 
 
 class RematTest(jtu.JaxTestCase):
@@ -6752,11 +6743,7 @@ class RematTest(jtu.JaxTestCase):
       return lax.cond(x.sum() > 0, f, lambda x: x, x)
 
     _, f_vjp = api.vjp(f, jnp.ones((5, 5)))
-    if config.vjp3.value:
-      jaxpr_text = str(f_vjp.jaxpr)
-    else:
-      jaxpr_text = str(f_vjp.jaxpr)
-
+    jaxpr_text = str(f_vjp.jaxpr)
     self.assertEqual(jaxpr_text.count(' sin '), 2)
     self.assertEqual(jaxpr_text.count(' cos '), 3)
     # Five calls to dot_general in the backward pass because we have two for
@@ -7207,10 +7194,10 @@ class JaxprTest(jtu.JaxTestCase):
   def test_cond(self):
     def f(x):
       return lax.cond(x >= 0.,
+                      lambda xt, _: xt + x,
+                      lambda _, xf: xf - x,
                       x + 1.,
-                      lambda xt: xt + x,
-                      x + 2.,
-                      lambda xf: xf - x)
+                      x + 2.)
     expected = """{ lambda ; a:f32[]. let
     b:bool[] = ge a 0.0:f32[]
     c:f32[] = add a 1.0:f32[]
@@ -7782,9 +7769,12 @@ class InputSavedVJPTest(jtu.JaxTestCase):
     def f(x, y):
       return x * y
 
-    primals = 2., 3.
-    y, f_vjp = api.si_vjp(f, [True, True], *primals)
-    arg_cts = f_vjp(1., *primals)
+    primals = [2., 3.]
+    y, f_vjp = jax.vjp(f, *primals)
+    f_vjp.args_res = [None, None]
+    y_grad = 1.
+    f_vjp.args_res = primals
+    arg_cts = f_vjp(1.)
     self.assertAllClose(y, 6.)
     self.assertAllClose(arg_cts, (3., 2.))
 
@@ -7795,77 +7785,53 @@ class InputSavedVJPTest(jtu.JaxTestCase):
     @jax.jit
     def g():
       primals = 2., 3.
-      y, f_vjp = api.si_vjp(f, [True, True], *primals)
+      y, f_vjp = jax.vjp(f, *primals)
+      f_vjp.args_res = [None, None]
       return y, f_vjp
 
     @jax.jit
     def h(f_vjp):
-      return f_vjp(1., 2., 3.)
+      f_vjp.args_res = [2., 3.]
+      return f_vjp(1.)
 
     y, f_vjp = g()
     arg_cts = h(f_vjp)
     self.assertAllClose(y, 6.)
     self.assertAllClose(arg_cts, (3., 2.))
 
-  def test_basic_unused(self):
-    f = jnp.sin
-    primals = 3.,
-    y, f_vjp = api.si_vjp(f, [True], *primals)
-    x_ct, = f_vjp(1., *primals)
-    self.assertAllClose(y, jnp.sin(3.))
-    self.assertAllClose(x_ct, jnp.cos(3.))
-
-    with self.assertRaisesRegex(Exception, "not used by the backward pass: x"):
-      _ = api.si_vjp(f, [True], *primals, allow_unused=False)
-
   def test_basic_unused_vjp3(self):
     f = jnp.sin
     primals = 3.,
-    y, f_vjp = api.vjp3(f, *primals)
+    y, f_vjp = api.vjp(f, *primals)
     x_ct, = f_vjp(1.)
     self.assertAllClose(y, jnp.sin(3.))
     self.assertAllClose(x_ct, jnp.cos(3.))
     self.assertIsInstance(f_vjp.args_res[0], api.NotNeeded)  # can check if unused
 
-  def test_basic_opaque(self):
-    f = jnp.sin
-    primals = 3.,
-    with self.assertRaisesRegex(Exception, "the backward pass requires opaque"):
-      _ = api.si_vjp(f, [True], *primals, allow_opaque=False)
-
   def test_basic_opaque_vjp3(self):
     f = jnp.sin
     primals = 3.,
-    _, f_vjp = api.vjp3(f, *primals)
-    assert f_vjp.opaque_residuals  # can detect if opaque res are used
+    _, f_vjp = api.vjp(f, *primals)
+    self.assertTrue(f_vjp.opaque_residuals)  # can detect if opaque res are used
 
   def test_basic_pytree_error(self):
     def f(x):
       return [x['hi'] * x['bye']]
 
-    y, f_vjp = api.si_vjp(f, [True], {'hi': 2., 'bye': 3.})
-    arg_ct, = f_vjp([1.], {'hi': 2., 'bye': 3.})
+    y, f_vjp = jax.vjp(f, {'hi': 2., 'bye': 3.})
+    f_vjp.args_res = [None]
+    y_grad = [1.]
+    f_vjp.args_res = [{'hi': 2., 'bye': 3.}]
+    arg_ct, = f_vjp(y_grad)
     self.assertAllClose(y, [6.])
     self.assertAllClose(arg_ct, {'hi': 3., 'bye': 2.})
 
-    with self.assertRaisesRegex(ValueError, "but the structures differ"):
-      f_vjp(1., {'hi': 2.})
+    # TODO(mattjj): Raise an error message.
+    # with self.assertRaisesRegex(ValueError, "but the structures differ"):
+    #   f_vjp.args_res = [{'hi': 2.}]
+    #   f_vjp([1.])
 
-  # TODO(mattjj): improve this vjp3 error message
-  # def test_basic_pytree_error_vjp3(self):
-  #   def f(x):
-  #     return [x['hi'] * x['bye']]
-
-  #   y, f_vjp = api.vjp3(f, {'hi': 2., 'bye': 3.})
-  #   arg_ct, = f_vjp([1.], {'hi': 2., 'bye': 3.})
-  #   self.assertAllClose(y, [6.])
-  #   self.assertAllClose(arg_ct, {'hi': 3., 'bye': 2.})
-
-  #   f_vjp.args_res[0] = {'hi': 2.}
-  #   with self.assertRaisesRegex(ValueError, "but the structures differ"):
-  #     f_vjp(1.)
-
-  def test_fsdp(self):
+  def test_fsdp_error(self):
     # see https://github.com/jax-ml/jax/pull/27017 for why this is called "fsdp"
     def f2(x, w):
       x = 1. * x
@@ -7875,10 +7841,12 @@ class InputSavedVJPTest(jtu.JaxTestCase):
 
     x = jnp.ones((3, 4))
     w = jnp.ones((4, 4))
-    y, f2_sivjp = api.si_vjp(f2, [False, True], x, w)
-    y_grad = jnp.ones_like(y)
-    x_grad, w_grad = f2_sivjp(y_grad, w)
-    self.assertAllClose(x_grad, 2. * y_grad @ w.T)
+    y, f2_vjp = jax.vjp(f2, x, w)
+    f2_vjp.args_res[1] = None
+    y_grad = jnp.ones((2, 4))
+    f2_vjp.args_res[1] = w
+    with self.assertRaisesRegex(ValueError, "unexpected JAX type"):
+      f2_vjp(y_grad)
 
   def test_fsdp_vjp3(self):
     # see https://github.com/jax-ml/jax/pull/27017 for why this is called "fsdp"
@@ -7890,7 +7858,7 @@ class InputSavedVJPTest(jtu.JaxTestCase):
 
     x = jnp.ones((3, 4))
     w = jnp.ones((4, 4))
-    y, f2_vjp = api.vjp3(f2, x, w)
+    y, f2_vjp = api.vjp(f2, x, w)
     f2_vjp.args_res[1] = None
     y_grad = jnp.ones_like(y)
     f2_vjp.args_res[1] = w
@@ -7900,9 +7868,10 @@ class InputSavedVJPTest(jtu.JaxTestCase):
     self.assertAllClose(w_grad, 2. * x.T @ y_grad)
 
   def test_doesnt_leak_symbolic_zeros(self):
-    _, vjp = api.si_vjp(lambda x: 1., [False], 3.14)
+    _, vjp = jax.vjp(lambda x: 1., 3.14)
     ans, = vjp(1.0)
     self.assertIsInstance(ans, jax.Array)
+
 
 class TracebackTest(jtu.JaxTestCase):
   # These tests are to catch regressions in Python traceback sizes. Our
@@ -7941,10 +7910,10 @@ class TracebackTest(jtu.JaxTestCase):
     jax.lax.scan(f, 0, jnp.arange(4))
 
   def test_cond_traceback(self):
-    if sys.version_info < (3, 14):
+    if sys.version_info < (3, 13):
       # Fails because 3.11 adds an extra stack frame due to a list comprehension
       self.skipTest("Expected failure.")
-    expected_depth = 8
+    expected_depth = 4
     init_depth = self.cur_depth()
 
     def f():
@@ -7954,7 +7923,7 @@ class TracebackTest(jtu.JaxTestCase):
 
   def test_jit_traceback(self):
     # TODO(dougalm): improve this! jit can (and should) be nested a lot.
-    expected_depth = 14
+    expected_depth = 13
     init_depth = self.cur_depth()
     @jit
     def foo(x):
@@ -7964,7 +7933,7 @@ class TracebackTest(jtu.JaxTestCase):
 
   def test_grad_traceback(self):
     # TODO(dougalm): improve this
-    expected_depth = 13
+    expected_depth = 11
     init_depth = self.cur_depth()
 
     def foo(x):
@@ -7975,7 +7944,7 @@ class TracebackTest(jtu.JaxTestCase):
 
   def test_vmap_traceback(self):
     # TODO(dougalm): improve this
-    expected_depth = 8
+    expected_depth = 7
     init_depth = self.cur_depth()
 
     def foo(x):
@@ -7986,9 +7955,9 @@ class TracebackTest(jtu.JaxTestCase):
 
   def test_custom_vjp_traceback(self):
     # TODO(dougalm): improve this
-    expected_depth_f = 11
-    expected_depth_f_fwd = 22
-    expected_depth_f_rev = 13
+    expected_depth_f = 10
+    expected_depth_f_fwd = 19
+    expected_depth_f_rev = 12
     init_depth = self.cur_depth()
     @jax.custom_vjp
     def f(x):

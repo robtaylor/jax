@@ -40,6 +40,7 @@ from jax._src.core import pvary, Tracer, typeof, shard_aval, unshard_aval
 from jax._src.mesh import (AbstractMesh, Mesh, BaseMesh, AxisType,
                            use_abstract_mesh, get_abstract_mesh,
                            get_concrete_mesh)
+from jax._src.pjit import reshard
 from jax._src.lax import lax, parallel as lax_parallel
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import hlo, sdy
@@ -247,6 +248,15 @@ def _shard_map(f: Callable, *, mesh: Mesh | AbstractMesh | None,
     if check_vma:
       fun = _implicit_pvary_on_output(fun, out_specs_thunk)
       fun = _implicit_unreduced_on_output(fun, out_specs_thunk)
+
+    # TODO(yashkatariya): Add support for partial manual
+    mesh_axis_names_wo_vmap = (
+        frozenset(mesh.axis_names) - core.get_axis_env().explicit_mesh_axis_names)
+    if (mesh_axis_names_wo_vmap == axis_names and
+        all(mesh._name_to_type[a] == AxisType.Explicit for a in axis_names)):
+      args_flat = [a if typeof(a).sharding.spec == s
+                   else reshard(a, NamedSharding(mesh, s))
+                   for a, s in zip(args_flat, in_specs_flat)]
 
     try:
       out_flat = shard_map_p.bind(
@@ -1381,8 +1391,6 @@ def _shard_map_batch(
     in_specs, out_specs_thunk, check_vma: bool, manual_axes: frozenset
     ) -> Sequence[batching.BatchTracer]:
   in_vals, in_dims = unzip2(map(trace.to_batch_info, in_tracers))
-  if any(isinstance(d, batching.RaggedAxis) for d in in_dims):
-    raise NotImplementedError
   spmd_axis_name = trace.axis_data.spmd_name
   explicit_mesh_axis = trace.axis_data.explicit_mesh_axis
   if spmd_axis_name is not None:

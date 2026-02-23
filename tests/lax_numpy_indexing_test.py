@@ -237,6 +237,11 @@ ADVANCED_INDEXING_TESTS = [
     IndexSpec(shape=(3,), indexer=np.array([0, 1, 0]), out_shape=(3,)),
     IndexSpec(shape=(3, 4, 5), indexer=np.array([ 0, -1]), out_shape=(2, 4, 5)),
   ]),
+  ("TupleOfEmptyList", [
+    IndexSpec(shape=(3, 4), indexer=([],), out_shape=(0, 4)),
+    IndexSpec(shape=(3, 4), indexer=([], 0), out_shape=(0,)),
+    IndexSpec(shape=(3, 4), indexer=([], []), out_shape=(0,)),
+  ]),
   ("TupleOfListsOfPythonInts", [
     IndexSpec(shape=(3, 4, 5), indexer=([0, 1],), out_shape=(2, 4, 5)),
     IndexSpec(shape=(3, 4, 5), indexer=([[0], [-1]], [[2, 3, 0, 3]]),
@@ -460,15 +465,15 @@ class IndexingStrategyTest(jtu.JaxTestCase):
     self._CompileAndCheck(jnp_fun, args_maker)
 
   @parameterized.parameters(
-      ((2,), -4, IndexError, "index -4 out of bounds for axis 0  with size 2"),
-      ((2,), 4, IndexError, "index 4 out of bounds for axis 0  with size 2"),
-      ((2, 3), np.index_exp[:, 4], IndexError, "index 4 out of bounds for axis 1  with size 3"),
-      ((2, 3), np.index_exp[..., -4], IndexError, "index -4 out of bounds for axis 1  with size 3"),
-      ((2, 3, 5), np.index_exp[3, :, 0], IndexError, "index 3 out of bounds for axis 0  with size 2"),
+      ((2,), -4, IndexError, "index -4 out of bounds for axis 0 with size 2"),
+      ((2,), 4, IndexError, "index 4 out of bounds for axis 0 with size 2"),
+      ((2, 3), np.index_exp[:, 4], IndexError, "index 4 out of bounds for axis 1 with size 3"),
+      ((2, 3), np.index_exp[..., -4], IndexError, "index -4 out of bounds for axis 1 with size 3"),
+      ((2, 3, 5), np.index_exp[3, :, 0], IndexError, "index 3 out of bounds for axis 0 with size 2"),
       ((2, 3), ([1, 2], 0), TypeError, "static_slice: indices must be static scalars or slices."),
       ((2, 3), (np.arange(2), 0), TypeError, "static_slice: indices must be static scalars or slices."),
       ((2, 3), (None, 0), TypeError, "static_slice: got None at position 0"),
-      ((2, 3), (1, 2, 3), IndexError, "Too many indices: 2-dimensional array indexed with 3 regular indices"),
+      ((2, 3), (1, 2, 3), IndexError, "Too many indices: array is 2-dimensional, but 3 were indexed"),
   )
   def test_slice_oob_indexing_fails(self, shape, idx, err, msg):
     arr = jnp.zeros(shape)
@@ -1033,10 +1038,10 @@ class IndexingTest(jtu.JaxTestCase):
                                 "index .* is out of bounds for axis .* with size 0"):
       _ = np.ones((2, 0))[0, 0]  # The numpy error
     with self.assertRaisesRegex(IndexError,
-                                "index is out of bounds for axis .* with size 0"):
+                                "index .* out of bounds for axis .* with size 0"):
       _ = x[0, 0]  # JAX indexing
     with self.assertRaisesRegex(IndexError,
-                                "index is out of bounds for axis .* with size 0"):
+                                "index .* out of bounds for axis .* with size 0"):
       jax.jit(lambda i: x[0, i])(0)  # JAX indexing under jit
 
   def testBooleanIndexingWithEmptyResult(self):
@@ -1330,11 +1335,11 @@ class IndexingTest(jtu.JaxTestCase):
   def testWrongNumberOfIndices(self):
     with self.assertRaisesRegex(
         IndexError,
-        "Too many indices: 0-dimensional array indexed with 1 regular index."):
+        "Too many indices: array is 0-dimensional, but 1 were indexed"):
       jnp.array(1)[0]
     with self.assertRaisesRegex(
         IndexError,
-        "Too many indices: 1-dimensional array indexed with 2 regular indices."):
+        "Too many indices: array is 1-dimensional, but 2 were indexed"):
       jnp.zeros(3)[:, 5]
 
   @jtu.sample_product(shape=[(), (1,)])
@@ -1344,6 +1349,13 @@ class IndexingTest(jtu.JaxTestCase):
     idx = jnp.int8(0).reshape(shape)
     expected = np.array(999).reshape(shape)
     self.assertArraysEqual(numbers[999, idx], expected)
+
+  def testIndexingTypedNdArray(self):
+    x = jnp.arange(4)
+    i = dtypes.canonicalize_value(np.array([2, 0, 1]))
+    result = x[i]
+    expected = x[jnp.asarray(i)]
+    self.assertArraysEqual(result, expected)
 
 
 def _broadcastable_shapes(shape):
@@ -1848,6 +1860,55 @@ class IndexedUpdateTest(jtu.JaxTestCase):
 
     self.assertArraysEqual(jax.jacrev(f)(x, i), expected)
     self.assertArraysEqual(jax.jacrev(jax.vmap(f, (None, 0)))(x, i), expected)
+
+@jtu.with_config(jax_check_static_indices=True)
+class ValidateIndicesTest(jtu.JaxTestCase):
+  @parameterized.parameters(
+      ((2,), -4, IndexError, "index -4 out of bounds for axis 0 with size 2"),
+      ((2,), 4, IndexError, "index 4 out of bounds for axis 0 with size 2"),
+      ((2, 3), np.index_exp[:, 4], IndexError, "index 4 out of bounds for axis 1 with size 3"),
+      ((2, 3), np.index_exp[..., -4], IndexError, "index -4 out of bounds for axis 1 with size 3"),
+      ((2, 3, 5), np.index_exp[3, :, 0], IndexError, "index 3 out of bounds for axis 0 with size 2"),
+      ((2, 3, 5), np.index_exp[:5, :, 6], IndexError, "index 6 out of bounds for axis 2 with size 5"),
+      ((2, 3, 5), np.index_exp[:, [1, 2], 6], IndexError, "index 6 out of bounds for axis 2 with size 5"),
+      ((2, 3, 5), np.index_exp[np.arange(3), 6, None], IndexError, "index 6 out of bounds for axis 1 with size 3"),
+      ((2, 3), (1, 2, 3), IndexError, "Too many indices: array is 2-dimensional, but 3 were indexed"),
+  )
+  def test_out_of_bound_indices(self, shape, idx, err, msg):
+    """Test that out-of-bound indexing """
+    arr = jnp.zeros(shape)
+
+    with self.subTest("eager"):
+      with self.assertRaisesRegex(err, msg):
+        arr[idx]
+
+    with self.subTest("jit"):
+      with self.assertRaisesRegex(err, msg):
+        jax.jit(lambda x: x[idx])(arr)
+
+    with self.subTest("arr.at[idx].get()"):
+      with self.assertRaisesRegex(err, msg):
+        arr.at[idx].get()
+
+  @jtu.sample_product(
+    [dict(name=name, shape=shape, indexer=indexer)
+     for name, index_specs in STATIC_INDEXING_TESTS
+     for shape, indexer, _ in index_specs],
+    dtype=all_dtypes
+  )
+  def test_simple_indexing(self, name, shape, dtype, indexer):
+    """Test that in-bound indexing works correctly."""
+    rng = jtu.rand_default(self.rng())
+    args_maker = lambda: [rng(shape, dtype)]
+    np_fun = lambda x: np.asarray(x)[indexer]
+    jnp_fun = lambda x: jnp.asarray(x)[indexer]
+    self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker)
+    self._CompileAndCheck(jnp_fun, args_maker)
+
+    # Tests x.at[...].get(...) as well.
+    jnp_fun = lambda x: jnp.asarray(x).at[indexer].get()
+    self._CheckAgainstNumpy(np_fun, jnp_fun, args_maker)
+    self._CompileAndCheck(jnp_fun, args_maker)
 
 if __name__ == "__main__":
   absltest.main(testLoader=jtu.JaxTestLoader())

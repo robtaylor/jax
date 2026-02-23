@@ -22,6 +22,7 @@ import jax
 from jax import lax
 from jax._src import dtypes
 from jax._src import test_util as jtu
+from jax._src.pallas import pallas_test_util as ptu
 from jax.experimental import pallas as pl
 import jax.numpy as jnp
 import numpy as np
@@ -76,22 +77,8 @@ def rand(
   raise NotImplementedError(f"Unsupported random data generation for {dtype=}")
 
 
-class PallasBaseTest(jtu.JaxTestCase):
-  INTERPRET = False
-
-  def setUp(self):
-    if not jtu.test_device_matches(["tpu"]):
-      self.skipTest("Test only supported on TPU.")
-
-    super().setUp()
-
-  @classmethod
-  def pallas_call(cls, *args, **kwargs):
-    return pl.pallas_call(*args, interpret=cls.INTERPRET, **kwargs)
-
-
 @jtu.thread_unsafe_test_class(condition=not jtu.hypothesis_is_thread_safe())
-class OpsTest(PallasBaseTest):
+class OpsTest(ptu.PallasTPUTest):
 
   @parameterized.product(
       from_dtype=_JAX_DTYPES,
@@ -207,8 +194,6 @@ class OpsTest(PallasBaseTest):
     )
 
   def test_sum_of_two_matmuls(self):
-    if not jtu.if_cloud_tpu_at_least(2025, 11, 15):
-      self.skipTest("Test requires libtpu from 2025/11/15 or later")
     if not jtu.is_device_tpu_at_least(version=5):
       self.skipTest("Test requires TPUv5+")
 
@@ -362,8 +347,6 @@ class OpsTest(PallasBaseTest):
       keepdims=[False, True],
   )
   def test_reduce_index(self, axis, in_shape, reduce_func, keepdims):
-    if not keepdims and not jtu.if_cloud_tpu_at_least(2025, 11, 24):
-      self.skipTest("Requires libtpu built after 2025-11-24")
     dtype = jnp.float32
     rank = len(in_shape)
     if axis >= rank:
@@ -402,8 +385,6 @@ class OpsTest(PallasBaseTest):
       dtype=[jnp.float32, jnp.bfloat16],
   )
   def test_i1_relayout_bw(self, shape, msk_dtype, dtype):
-    if shape[0] < 8 and not jtu.if_cloud_tpu_at_least(2025, 11, 9):
-      self.skipTest("Requires libtpu built after 2025-11-09")
     msk_bitwidth = dtypes.itemsize_bits(msk_dtype)
     bitwidth = dtypes.itemsize_bits(dtype)
     if jtu.get_tpu_version() < 5 and msk_bitwidth < 32:
@@ -437,8 +418,6 @@ class OpsTest(PallasBaseTest):
   )
   def test_i1_relayout_bw_tiling(self, msk_dtype, dtype):
     self.skipTest("TODO: jevinjiang - Enable once presubmits pass.")
-    if not jtu.if_cloud_tpu_at_least(2025, 10, 7):
-      self.skipTest("Requires libtpu built after 2025-10-07")
     shape = (256, 256)
     bitwidth = dtypes.itemsize_bits(dtype)
     msk_bitwidth = dtypes.itemsize_bits(msk_dtype)
@@ -721,8 +700,6 @@ class OpsTest(PallasBaseTest):
     self.assertEqual(output, 0)
 
   def test_retiling_with_replicated_lane(self):
-    if not jtu.if_cloud_tpu_at_least(2025, 11, 5):
-      self.skipTest("Test requires libtpu from 2025/11/5 or later")
     shape = (32, 1)
     broadcast_shape = (32, 256)
 
@@ -746,8 +723,6 @@ class OpsTest(PallasBaseTest):
   def test_stochastic_round(self, target_dtype):
     if not jtu.is_device_tpu_at_least(version=5):
       self.skipTest("Requires TPU v5+")
-    if not jtu.if_cloud_tpu_at_least(2025, 10, 29):
-      self.skipTest("Test requires libtpu from 2025/10/29 or later")
 
     def kernel(x_ref, b_ref, o_ref):
       o_ref[...] = pltpu.stochastic_round(
@@ -783,28 +758,31 @@ class OpsTest(PallasBaseTest):
   def _pack_unpack_elementwise_test_data(
       self, shape, unpacked_dtype, packed_dtype):
     """Generates data for test_pack_elementwise and test_unpack_elementwise."""
-    bitwidth = dtypes.itemsize_bits(packed_dtype)
-    num_sources = 32 // bitwidth
-    if unpacked_dtype == jnp.int32:
+    unpacked_bitwidth = dtypes.itemsize_bits(unpacked_dtype)
+    packed_bitwidth = dtypes.itemsize_bits(packed_dtype)
+    num_sources = unpacked_bitwidth // packed_bitwidth
+    if jnp.issubdtype(unpacked_dtype, jnp.integer):
       stacked_sources = jax.random.randint(
           jax.random.key(0),
           (num_sources, *shape),
           minval=-1000,
           maxval=1000,
-          dtype=unpacked_dtype,
-      )
+          dtype=jnp.int32,
+      ).astype(unpacked_dtype)
     else:
       stacked_sources = jax.random.uniform(
           jax.random.key(0), (num_sources, *shape), dtype=unpacked_dtype
       )
     stacked_results = (
         stacked_sources.astype(packed_dtype)
-        .view(getattr(jnp, f"uint{bitwidth}"))
-        .astype(jnp.uint32)
+        .view(getattr(jnp, f"uint{packed_bitwidth}"))
+        .astype(getattr(jnp, f"uint{unpacked_bitwidth}"))
     )
-    shifts = jnp.arange(num_sources, dtype=jnp.uint32) * bitwidth
+    shifts = jnp.arange(num_sources, dtype=jnp.uint32) * packed_bitwidth
     shifts = jnp.expand_dims(shifts, axis=tuple(range(1, stacked_results.ndim)))
-    packed_data = jnp.bitwise_or.reduce(stacked_results << shifts, axis=0)
+    packed_data = jnp.bitwise_or.reduce(
+        stacked_results.astype(jnp.uint32) << shifts, axis=0
+    ).astype(getattr(jnp, f"uint{unpacked_bitwidth}"))
     return stacked_sources, packed_data
 
   @parameterized.product(
@@ -813,6 +791,8 @@ class OpsTest(PallasBaseTest):
           (jnp.int32, jnp.int16),
           (jnp.int32, jnp.int8),
           (jnp.int32, jnp.int4),
+          (jnp.int16, jnp.int8),
+          (jnp.int8, jnp.int4),
       ],
       shape=[(8, 128), (2, 15, 300)],
   )
@@ -820,11 +800,15 @@ class OpsTest(PallasBaseTest):
     unpacked_dtype, packed_dtype = config
     if not jtu.is_device_tpu_at_least(version=5):
       self.skipTest("Requires TPU v5+")
-    if not jtu.if_cloud_tpu_at_least(2025, 11, 7):
-      self.skipTest("Test requires libtpu from 2025/11/7 or later")
+    if dtypes.itemsize_bits(
+        unpacked_dtype
+    ) != 32 and not jtu.is_cloud_tpu_at_least(2026, 1, 2):
+      self.skipTest("Test requires libtpu from 2026/01/02 or later")
 
-    bitwidth = dtypes.itemsize_bits(packed_dtype)
-    num_sources = 32 // bitwidth
+    src_bitwidth = dtypes.itemsize_bits(unpacked_dtype)
+    tgt_bitwidth = dtypes.itemsize_bits(packed_dtype)
+    num_sources = src_bitwidth // tgt_bitwidth
+    output_dtype = getattr(jnp, f"uint{src_bitwidth}")
 
     def kernel(xs_ref, o_ref):
       xs = [xs_ref[i] for i in range(num_sources)]
@@ -836,7 +820,7 @@ class OpsTest(PallasBaseTest):
 
     result = self.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct(shape, jnp.uint32),
+        out_shape=jax.ShapeDtypeStruct(shape, output_dtype),
     )(stacked_sources)
 
     np.testing.assert_array_equal(result, expected)
@@ -855,8 +839,6 @@ class OpsTest(PallasBaseTest):
     unpacked_dtype, packed_dtype = config
     if not jtu.is_device_tpu_at_least(version=5):
       self.skipTest("Requires TPU v5+")
-    if not jtu.if_cloud_tpu_at_least(2025, 11, 7):
-      self.skipTest("Test requires libtpu from 2025/11/7 or later")
 
     bitwidth = dtypes.itemsize_bits(packed_dtype)
     packing_factor = 32 // bitwidth
@@ -882,6 +864,7 @@ class OpsTest(PallasBaseTest):
     )(packed)
 
     np.testing.assert_array_equal(result, expected)
+
 
 if __name__ == "__main__":
   absltest.main()
